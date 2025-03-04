@@ -363,6 +363,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         std::optional<at::Generator> gen_) {
 
     // Otherwise the kernel will be launched from cuda:0 device
+    // CUDAGuard用于管理 CUDA 设备的上下文,确保在其作用域内，CUDA 操作在指定的设备上执行 
+    // device_guard{q.device()} 创建了一个 CUDAGuard 对象，将当前的 CUDA 设备设置为 q 所在的设备
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
@@ -377,6 +379,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
 
+    //q.stride(-1) 返回张量 q 在最后一个维度上的步幅（stride）
+    //步幅是指在内存中相邻元素之间的距离。对于一个连续的张量，最后一个维度的步幅应该是 1
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");

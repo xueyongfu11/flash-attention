@@ -77,6 +77,9 @@ else:
     _torch_custom_op_wrapper = noop_custom_op_wrapper
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
+# noop_custom_op_wrapper 更侧重于自定义操作的包装，而 noop_register_fake_wrapper 更侧重于伪操作的注册。
+# _torch_custom_op_wrapper 是一个“无操作”包装器（noop wrapper），这意味着它不会对函数进行实际的修改或包装
+# 这种设计可能是为了提供一个统一的接口，以便在需要时可以轻松替换为实际的操作包装器。
 
 @_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(
