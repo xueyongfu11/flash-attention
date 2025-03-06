@@ -48,6 +48,10 @@ struct Qkv_params {
 struct Flash_fwd_params : public Qkv_params {
 
     // The O matrix (output).
+    /*
+    __restrict__ 是一种指针限定符，表示该指针是唯一访问其所指向数据的方式。使用 __restrict__ 可以帮助编译器进行优化，因为它可以假设通过该指针访问的数据不会与其他指针重叠。
+    这种优化在处理大量数据时尤其有用，因为它可以减少不必要的内存访问，提高程序的执行效率
+    */
     void * __restrict__ o_ptr;
     void * __restrict__ oaccum_ptr;
 

@@ -52,9 +52,17 @@ void set_params_fprop(Flash_fwd_params &params,
                       bool seqlenq_ngroups_swapped=false,
                       const bool unpadded_lse=false) {
 
+    /*
+    h: num_heads
+    h_k: num_heads_k
+    d: head_size
+    d_rounded: head_size_rounded
+    */
+
     // Reset the parameters
     params = {};
 
+    //用于检查张量 q 的数据类型是否为 BFloat16
     params.is_bf16 = q.dtype() == torch::kBFloat16;
 
     // Set the pointers and strides.
@@ -62,6 +70,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.k_ptr = k.data_ptr();
     params.v_ptr = v.data_ptr();
     // All stride are in elements, not bytes.
+    // 对于一个形状为(3,4,5)的张量，q.stride()通常返回(20,5,1)
     params.q_row_stride = q.stride(-3);
     params.k_row_stride = k.stride(-3);
     params.v_row_stride = v.stride(-3);
@@ -126,8 +135,10 @@ void set_params_fprop(Flash_fwd_params &params,
     // [Minor] We want to round down since when we do the comparison we use <= instead of <
     // params.p_dropout_in_uint = uint32_t(std::floor(params.p_dropout * 4294967295.0));
     // params.p_dropout_in_uint16_t = uint16_t(std::floor(params.p_dropout * 65535.0));
+    // 通过将 params.p_dropout 乘以 255.0 并向下取整，得到一个 uint8_t 类型的整数 params.p_dropout_in_uint8_t。这使得在后续的随机数比较中可以直接使用整数进行比较。
     params.p_dropout_in_uint8_t = uint8_t(std::floor(params.p_dropout * 255.0));
     params.rp_dropout = 1.f / params.p_dropout;
+    // 将 params.rp_dropout 与 params.scale_softmax 相乘，得到一个新的缩放因子 params.scale_softmax_rp_dropout。这可能用于在 softmax 操作中结合 dropout 的影响进行缩放。
     params.scale_softmax_rp_dropout = params.rp_dropout * params.scale_softmax;
     TORCH_CHECK(p_dropout < 1.f);
     #ifdef FLASHATTENTION_DISABLE_DROPOUT
@@ -253,6 +264,9 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
         });
     });
 }
+
+// 选择 2 个分割时效率为 0.89 可能是基于对特定硬件和任务的实验分析得出的结果
+// 较少的分割数量可能减少了内存访问的开销，因为每个分割可以在内存中连续地处理数据
 
 // Find the number of splits that maximizes the occupancy. For example, if we have
 // batch * n_heads = 48 and we have 108 SMs, having 2 splits (efficiency = 0.89) is
@@ -409,7 +423,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
+    // seqlenq_ngroups_swappe为1时，使用multi-query/grouped-query attention
     const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
+    // multi-query/grouped-query attention中ngroups > 1
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
@@ -442,15 +458,19 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     auto opts = q.options();
 
+    // num_heads == num_heads_k == num_heads_v
+    // softmax_lse用来保存 累计softmax值
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
+    // P = softmax(QK^T)
+    // why?
     if (return_softmax) {
         TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
         p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
     }
     else {
-        p = torch::empty({ 0 }, opts);
+        p = torch::empty({ 0 }, opts); // 其形状为 { 0 }，表述不需要存储任何数据
     }
 
     Flash_fwd_params params;
@@ -489,10 +509,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
 
     if (p_dropout > 0.0)  {
+        // 获取一个 CUDA 随机数生成器（CUDAGeneratorImpl）。如果 gen_ 已经提供了一个生成器，则使用它；否则，使用默认的 CUDA 生成器
         auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
             gen_, at::cuda::detail::getDefaultCUDAGenerator());
         // See Note [Acquire lock when using random generators]
         std::lock_guard<std::mutex> lock(gen->mutex_);
+        //使用生成器的 philox_cuda_state 方法来获取 Philox 随机数生成器的状态，结合之前计算的 counter_offset
         params.philox_args = gen->philox_cuda_state(counter_offset);
     }
 
@@ -1479,6 +1501,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 }
 } // namespace FLASH_NAMESPACE
 
+// 特殊宏，使用大括号将代码块传入，避免以参数传递造成的难以阅读和维护问题
+// PYBIND11_MODULE 宏主要用于定义 Python 模块，使得 C++ 代码能够被 Python 解释器调用
+// 在python中执行import时，开始执行，将C++函数绑定到python
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashAttention";
     m.def("fwd", &FLASH_NAMESPACE::mha_fwd, "Forward pass");
