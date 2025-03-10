@@ -55,6 +55,8 @@ import triton.language as tl
 #     ],
 #     key=['CACHE_KEY_SEQLEN_Q', 'CACHE_KEY_SEQLEN_K', 'BIAS_TYPE', 'IS_CAUSAL', 'BLOCK_HEADDIM']
 # )
+
+# 装饰器，用于在编译时提供一些启发式的条件，以帮助优化内核的执行。这些条件通常用于决定是否可以应用某些优化或选择特定的实现路径。
 @triton.heuristics(
     {
         "EVEN_M": lambda args: args["seqlen_q"] % args["BLOCK_M"] == 0,
@@ -103,21 +105,28 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    start_m = tl.program_id(0)
-    off_hb = tl.program_id(1)
-    off_b = off_hb // nheads
-    off_h = off_hb % nheads
+    # tl.program_id 函数可以帮助开发者确定当前线程块在整个网格（grid）中的位置
+    start_m = tl.program_id(0)   # 范围从(0,Tr)，Tr = seqlen/Br
+    off_hb = tl.program_id(1)    # head*batch
+    # 通过二维网格的配置，获取当前的批次cur_batch_idx和当前的头cur_head_idx
+    off_b = off_hb // nheads  # off_b的值范围是从0到batch_size-1
+    off_h = off_hb % nheads   # off_h的取值范围是从0到nheads - 1
     # off_b = tl.program_id(1)
     # off_h = tl.program_id(2)
     # off_hb = off_b * nheads + off_h
     # initialize offsets
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
+    # 获取当前block处理q的seq_len维度的偏移
+    # 这里有一个隐形的并行
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)  # 分块的范围，对应到论文（i*Br, i*Br+Br-1）
+    offs_n = tl.arange(0, BLOCK_N)       
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     # Initialize pointers to Q, K, V
     # Adding parenthesis around indexing might use int32 math instead of int64 math?
     # https://github.com/openai/triton/issues/741
     # I'm seeing a tiny bit of difference (5-7us)
+
+    # offs_m[:, None]的作用是将offs_m从一维张量扩展为二维张量，其中每个元素成为一个单独的行
+    # offs_m[:, None] * stride_qm相当于对query做分块，分块的大小是Br
     q_ptrs = (
         Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
     )
@@ -158,9 +167,11 @@ def _fwd_kernel(
             )
     # loop over k, v and update accumulator
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
+    # 对j进行遍历，BLOCK_N是一个Bc
     for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
+        # 加载的key的大小是(Bc, dim)
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
             if EVEN_HEADDIM:
                 k = tl.load(k_ptrs + start_n * stride_kn)
@@ -845,9 +856,17 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
     tmp = torch.empty((batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
     o = torch.empty_like(q)
 
+    # triton.next_power_of_2(d)这个函数用于计算大于或等于d的最小的2的幂
     BLOCK_HEADDIM = max(triton.next_power_of_2(d), 16)
+    # 在许多实际应用中，128被证明是一个性能良好的块大小，特别是在深度学习和科学计算中
     BLOCK = 128
+    # 当d较小时，每个线程需要处理的数据量较少，因此不需要太多的warp来完成计算。
+    # 使用较少的warp可以减少资源的浪费，因为每个warp的线程数是固定的（通常为32），如果数据量较小，使用过多的warp可能导致部分线程闲置。
+    # 当d较小时，数据在内存中的布局可能更紧凑，使用较少的warp可以确保每个warp访问连续的内存区域，从而提高缓存命中率
     num_warps = 4 if d <= 64 else 8
+    # 二维网格允许更灵活地分配计算任务。例如，可以在一个维度上划分序列长度，在另一个维度上划分批次和头部。这种灵活性使得代码可以适应不同大小和形状的数据
+    # 通过合理的网格划分，可以确保每个线程块访问连续的内存区域，从而提高缓存命中率。
+    # META["BLOCK_M"]就是论文中的Br，因此triton.cdiv(seqlen_q, META["BLOCK_M"])就是Tr
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
     _fwd_kernel[grid](
         q,
@@ -883,7 +902,7 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
         bias_type,
         causal,
         BLOCK_HEADDIM,
-        BLOCK_M=BLOCK,
+        BLOCK_M=BLOCK,  # 在矩阵乘法中，假设有两个矩阵 \(A\) 和 \(B\)，其乘积为 \(C\)。通过将 \(A\) 和 \(B\) 分别在行和列方向上分块，可以将计算任务划分为多个小任务，每个小任务负责计算 \(C\) 的一个子块。这种方法可以显著提高计算效率。
         BLOCK_N=BLOCK,
         num_warps=num_warps,
         num_stages=1,
